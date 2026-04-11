@@ -1,0 +1,30 @@
+--name stone_syn_finetune
+--root exps/stone_syn_finetune
+--load_weights_folder stone_weights/my_stone_experiment_32bit/models/weights_15
+--epochs 20
+--bs 1
+--lr 1e-6
+--wd 0.01
+--div_factor 10
+--final_div_factor 100
+--validate_every 10
+--dataset stone
+--workers 1
+--w_chamfer 0
+--data_path stone_syn_dataset/
+--gt_path stone_syn_dataset/
+--filenames_file ./finetune/file_lists/stone_train_files_with_gt.txt
+--input_height 576
+--input_width 1024
+--amp
+--min_depth 0.01
+--max_depth 1.0
+--depth_scale 100000
+--depth_encoding float32_rgba
+--degree 0.0
+--data_path_eval stone_syn_dataset/
+--gt_path_eval stone_syn_dataset/
+--filenames_file_eval ./finetune/file_lists/stone_eval_files_with_gt.txt
+--min_depth_eval 0.01
+--max_depth_eval 1.0
+--same_lr
