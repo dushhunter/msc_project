@@ -1,0 +1,64 @@
+def validate_full_epoch(self):
+  """Run validation over the entire val set and return abs_rel.
+  Returns None if GT depth is not available.
+  """
+  self.set_eval()
+  abs_rel_sum = 0.0
+  rmse_sum = 0.0
+  count = 0
+  with torch.no_grad():
+      for inputs in self.val_loader:
+          for key, ipt in inputs.items():
+              inputs[key] = ipt.to(self.device)
+          features = self.models["encoder"](inputs["color_aug", 0, 0])
+          outputs = self.models["depth"](features)
+          if "depth_gt" not in inputs:
+              self.set_train()
+              return None
+          depth_pred = outputs[("disp", 0)]
+          depth_gt = inputs["depth_gt"]
+          if depth_pred.dim() == 3:
+              depth_pred = depth_pred.unsqueeze(1)
+          if depth_gt.dim() == 3:
+              depth_gt = depth_gt.unsqueeze(1)
+          if depth_pred.shape[-2:] != depth_gt.shape[-2:]:
+              depth_pred = F.interpolate(
+                  depth_pred, depth_gt.shape[-2:], mode="bilinear", align_corners=False)
+          depth_pred = torch.clamp(depth_pred, self.opt.min_depth, self.opt.max_depth)
+          valid = (depth_gt > self.opt.min_depth) & (depth_gt < self.opt.max_depth)
+          if valid.sum() == 0:
+              continue
+          gt_valid = depth_gt[valid]
+          pred_valid = depth_pred[valid]
+          abs_rel_sum += (torch.abs(gt_valid - pred_valid) / gt_valid).mean().item()
+          rmse_sum += torch.sqrt(((gt_valid - pred_valid) ** 2).mean()).item()
+          count += 1
+  self.set_train()
+  if count == 0:
+      return None
+  avg_abs_rel = abs_rel_sum / count
+  avg_rmse = rmse_sum / count
+  print("  Epoch {} full val: abs_rel={:.6f}  rmse={:.6f}m ({:.4f}mm)".format(
+      self.epoch, avg_abs_rel, avg_rmse, avg_rmse * 1000))
+  self.writers["val"].add_scalar("epoch/abs_rel", avg_abs_rel, self.epoch)
+  self.writers["val"].add_scalar("epoch/rmse", avg_rmse, self.epoch)
+  self.writers["val"].add_scalar("epoch/rmse_mm", avg_rmse * 1000, self.epoch)
+  return avg_abs_rel
+def save_model_best(self):
+  """Save the best model weights to a fixed folder for easy access."""
+  save_folder = os.path.join(self.log_path, "models", "weights_best")
+  if not os.path.exists(save_folder):
+      os.makedirs(save_folder)
+  for model_name, model in self.models.items():
+      save_path = os.path.join(save_folder, "{}.pth".format(model_name))
+      if model_name == 'pose':
+          to_save = model.state_dict()
+      else:
+          to_save = model.module.state_dict()
+      if model_name == 'encoder':
+          to_save['height'] = self.opt.height
+          to_save['width'] = self.opt.width
+          to_save['use_stereo'] = self.opt.use_stereo
+      torch.save(to_save, save_path)
+  with open(os.path.join(save_folder, "best_epoch.txt"), "w") as f:
+      f.write("epoch: {}\nabs_rel: {:.6f}\n".format(self.best_epoch, self.best_abs_rel))
