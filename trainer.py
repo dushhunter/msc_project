@@ -279,16 +279,25 @@ class Trainer:
         """
         self.epoch = 0
         self.step = 0
+        self.best_abs_rel = float('inf')
+        self.best_epoch = -1
         self.start_time = time.time()
-        # run_id = f"{dt.now().strftime('%d-%h_%H-%M')}-nodebs{self.opt.batch_size}-tep{self.epoch}-lr{self.opt.learning_rate}--{uuid.uuid4()}"
-        # name = f"{experiment_name}_{run_id}"
-        # wandb.init(project=PROJECT, name=name, config=self.opt, dir='.')
         self.save_model()
         for self.epoch in range(self.opt.num_epochs):
             self.run_epoch()
             self.model_lr_scheduler.step()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
+            val_abs_rel = self.validate_full_epoch()
+            if val_abs_rel is not None and val_abs_rel < self.best_abs_rel:
+                self.best_abs_rel = val_abs_rel
+                self.best_epoch = self.epoch
+                self.save_model_best()
+                print("  ** Best model so far (abs_rel={:.6f}) saved at epoch {}".format(
+                    self.best_abs_rel, self.best_epoch))
+        print("\n=== Training complete ===")
+        print("  Best epoch: {}  (abs_rel={:.6f})".format(self.best_epoch, self.best_abs_rel))
+        print("  Best weights: {}/models/weights_best/".format(self.log_path))
 
     def run_epoch(self):
         """Run a single epoch of training and validation
@@ -298,21 +307,24 @@ class Trainer:
         print("Training")
         self.set_train()
 
+        accum_steps = getattr(self.opt, 'accumulation_steps', 1)
+        self.model_optimizer.zero_grad()
+
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
 
             outputs, losses = self.process_batch(inputs)
 
-            self.model_optimizer.zero_grad()
-            losses["loss"].backward()
-            self.model_optimizer.step()
+            scaled_loss = losses["loss"] / accum_steps
+            scaled_loss.backward()
+
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                self.model_optimizer.step()
+                self.model_optimizer.zero_grad()
 
             duration = time.time() - before_op_time
 
-            # Log at every log_frequency batches throughout training.
-            # (The original early/late split used KITTI-scale step counts and is
-            #  too sparse for the stone dataset's ~7 k total steps.)
             should_log = (batch_idx % self.opt.log_frequency == 0)
 
             if should_log:
@@ -458,6 +470,90 @@ class Trainer:
             del inputs, outputs, losses
 
         self.set_train()
+
+    def validate_full_epoch(self):
+        """Run validation over the entire val set and return abs_rel.
+
+        Returns None if GT depth is not available.
+        """
+        self.set_eval()
+        abs_rel_sum = 0.0
+        rmse_sum = 0.0
+        count = 0
+
+        with torch.no_grad():
+            for inputs in self.val_loader:
+                for key, ipt in inputs.items():
+                    inputs[key] = ipt.to(self.device)
+
+                features = self.models["encoder"](inputs["color_aug", 0, 0])
+                outputs = self.models["depth"](features)
+
+                if "depth_gt" not in inputs:
+                    self.set_train()
+                    return None
+
+                depth_pred = outputs[("disp", 0)]
+                depth_gt = inputs["depth_gt"]
+
+                if depth_pred.dim() == 3:
+                    depth_pred = depth_pred.unsqueeze(1)
+                if depth_gt.dim() == 3:
+                    depth_gt = depth_gt.unsqueeze(1)
+
+                if depth_pred.shape[-2:] != depth_gt.shape[-2:]:
+                    depth_pred = F.interpolate(
+                        depth_pred, depth_gt.shape[-2:], mode="bilinear", align_corners=False)
+
+                depth_pred = torch.clamp(depth_pred, self.opt.min_depth, self.opt.max_depth)
+                valid = (depth_gt > self.opt.min_depth) & (depth_gt < self.opt.max_depth)
+
+                if valid.sum() == 0:
+                    continue
+
+                gt_valid = depth_gt[valid]
+                pred_valid = depth_pred[valid]
+
+                abs_rel_sum += (torch.abs(gt_valid - pred_valid) / gt_valid).mean().item()
+                rmse_sum += torch.sqrt(((gt_valid - pred_valid) ** 2).mean()).item()
+                count += 1
+
+        self.set_train()
+
+        if count == 0:
+            return None
+
+        avg_abs_rel = abs_rel_sum / count
+        avg_rmse = rmse_sum / count
+        print("  Epoch {} full val: abs_rel={:.6f}  rmse={:.6f}m ({:.4f}mm)".format(
+            self.epoch, avg_abs_rel, avg_rmse, avg_rmse * 1000))
+
+        self.writers["val"].add_scalar("epoch/abs_rel", avg_abs_rel, self.epoch)
+        self.writers["val"].add_scalar("epoch/rmse", avg_rmse, self.epoch)
+        self.writers["val"].add_scalar("epoch/rmse_mm", avg_rmse * 1000, self.epoch)
+
+        return avg_abs_rel
+
+    def save_model_best(self):
+        """Save the best model weights to a fixed folder for easy access."""
+        save_folder = os.path.join(self.log_path, "models", "weights_best")
+        if not os.path.exists(save_folder):
+            os.makedirs(save_folder)
+
+        for model_name, model in self.models.items():
+            save_path = os.path.join(save_folder, "{}.pth".format(model_name))
+            if model_name == 'pose':
+                to_save = model.state_dict()
+            else:
+                to_save = model.module.state_dict()
+            if model_name == 'encoder':
+                to_save['height'] = self.opt.height
+                to_save['width'] = self.opt.width
+                to_save['use_stereo'] = self.opt.use_stereo
+            torch.save(to_save, save_path)
+
+        with open(os.path.join(save_folder, "best_epoch.txt"), "w") as f:
+            f.write("epoch: {}\nabs_rel: {:.6f}\n".format(self.best_epoch, self.best_abs_rel))
 
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
@@ -724,9 +820,56 @@ class Trainer:
                 depth_pred_gt = depth_pred
             valid = (depth_gt > self.opt.min_depth) & (depth_gt < self.opt.max_depth)
             if valid.sum() > 0:
-                gt_loss = F.l1_loss(depth_pred_gt[valid], depth_gt[valid])
+                gt_l1 = F.l1_loss(depth_pred_gt[valid], depth_gt[valid])
+                gt_log = torch.sqrt(
+                    torch.var(torch.log(depth_pred_gt[valid]) - torch.log(depth_gt[valid]))
+                    + 0.15 * torch.pow(torch.mean(torch.log(depth_pred_gt[valid]) - torch.log(depth_gt[valid])), 2)
+                )
+                gt_loss = gt_l1 + 0.5 * gt_log
                 losses["loss/gt_depth"] = gt_loss
+                losses["loss/gt_l1"] = gt_l1
+                losses["loss/gt_silog"] = gt_log
                 total_loss += self.opt.gt_depth_weight * gt_loss
+
+                # Depth-gradient loss: force the model to match surface slopes,
+                # not just absolute depth values. This captures curvature/detail.
+                grad_weight = getattr(self.opt, 'gt_grad_weight', 0.0)
+                if grad_weight > 0:
+                    pred_dx = depth_pred_gt[:, :, :, 1:] - depth_pred_gt[:, :, :, :-1]
+                    pred_dy = depth_pred_gt[:, :, 1:, :] - depth_pred_gt[:, :, :-1, :]
+                    gt_dx = depth_gt[:, :, :, 1:] - depth_gt[:, :, :, :-1]
+                    gt_dy = depth_gt[:, :, 1:, :] - depth_gt[:, :, :-1, :]
+                    valid_dx = valid[:, :, :, 1:] & valid[:, :, :, :-1]
+                    valid_dy = valid[:, :, 1:, :] & valid[:, :, :-1, :]
+                    grad_loss = torch.tensor(0.0, device=self.device)
+                    if valid_dx.sum() > 0:
+                        grad_loss = grad_loss + F.l1_loss(pred_dx[valid_dx], gt_dx[valid_dx])
+                    if valid_dy.sum() > 0:
+                        grad_loss = grad_loss + F.l1_loss(pred_dy[valid_dy], gt_dy[valid_dy])
+                    losses["loss/gt_grad"] = grad_loss
+                    total_loss += grad_weight * grad_loss
+
+                # Surface-normal loss: penalise angular difference between
+                # predicted and GT surface normals derived from depth.
+                normal_weight = getattr(self.opt, 'gt_normal_weight', 0.0)
+                if normal_weight > 0:
+                    def _depth_to_normals(d):
+                        dx = d[:, :, :, 1:] - d[:, :, :, :-1]
+                        dy = d[:, :, 1:, :] - d[:, :, :-1, :]
+                        dx = F.pad(dx, (0, 1, 0, 0))
+                        dy = F.pad(dy, (0, 0, 0, 1))
+                        ones = torch.ones_like(dx)
+                        n = torch.cat([-dx, -dy, ones], dim=1)
+                        return F.normalize(n, dim=1)
+                    pred_n = _depth_to_normals(depth_pred_gt)
+                    gt_n = _depth_to_normals(depth_gt)
+                    cos_sim = (pred_n * gt_n).sum(dim=1, keepdim=True)
+                    valid_n = valid.float()
+                    if valid_n.sum() > 0:
+                        normal_loss = (1.0 - cos_sim) * valid_n
+                        normal_loss = normal_loss.sum() / valid_n.sum().clamp(min=1)
+                        losses["loss/gt_normal"] = normal_loss
+                        total_loss += normal_weight * normal_loss
 
         # ENHANCEMENT #2: Depth smoothness regularization (edge-aware)
         # Encourages smooth depth predictions away from image edges
@@ -905,3 +1048,4 @@ class Trainer:
             print("Cannot find Adam weights so Adam is randomly initialized")
 
 
+Adam weights so Adam is randomly initialized")
