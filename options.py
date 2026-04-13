@@ -199,6 +199,14 @@ class MonodepthOptions:
                                  type=float,
                                  help="weight applied to the GT supervised depth loss term",
                                  default=1.0)
+        self.parser.add_argument("--gt_grad_weight",
+                                 type=float,
+                                 help="weight for depth-gradient loss (surface slope matching)",
+                                 default=0.0)
+        self.parser.add_argument("--gt_normal_weight",
+                                 type=float,
+                                 help="weight for surface-normal loss (angular surface matching)",
+                                 default=0.0)
 
         # Multi-view learning enhancements
         self.parser.add_argument("--use_smoothness_loss",
