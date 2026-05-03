@@ -1,0 +1,82 @@
+# ============================================================================
+# User options for tools/reconstruct_stone/reconstruct_3d.py
+#
+# Format: argparse-style, one `--option value` per line.  CLI flags override
+# any value set here.  Lines starting with `#` and blank lines are ignored.
+# Pass `--config /other/path.txt` to use a different config file.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Inputs / outputs
+# ----------------------------------------------------------------------------
+# Folder that contains the 8 .npy depth maps (one per turntable angle).
+--input_dir /slowfs/vgzebupv1/kdilan/github_clone/msc_project_new/8_direct_dept_images
+
+# Where to write the per-view PLYs, merged.ply, merged_white.ply and
+# transforms.json.
+--output_dir /slowfs/vgzebupv1/kdilan/github_clone/msc_project_new/3d_reconstruction
+
+
+# ----------------------------------------------------------------------------
+# Acquisition geometry
+# ----------------------------------------------------------------------------
+# Rotation angles (degrees), one per file in the sorted listing of --input_dir.
+# Stone rotates around the world Z axis (= ground-plane normal).
+--angles_deg 0,15,30,45,60,75,90,105
+
+# +1 = counter-clockwise around +Z (right-hand rule); -1 if reconstruction
+# appears mirror-rotated.
+--rotation_sign +1
+
+
+# ----------------------------------------------------------------------------
+# Camera settings
+# ----------------------------------------------------------------------------
+# true  : build pinhole intrinsics from --focal_mm and --sensor_mm.
+# false : ignore camera info, derive intrinsics from --horizontal_fov_deg
+#         and rely on the depth values for metric scale.
+--use_camera_settings true
+
+# Used when --use_camera_settings true. Blender defaults shown.
+--focal_mm 50.0
+--sensor_mm 36.0
+
+# Used when --use_camera_settings false.  Reasonable values:
+#   ~ 39.6 deg : Blender 50 mm on 36 mm sensor (1024x576)
+#   ~ 65.0 deg : typical phone main camera
+#   ~120.0 deg : action camera / wide-angle
+--horizontal_fov_deg 50.0
+
+# Optional principal-point overrides; leave commented out to use the image
+# centre.
+# --cx 511.5
+# --cy 287.5
+
+
+# ----------------------------------------------------------------------------
+# Reconstruction tuning (metres)
+# ----------------------------------------------------------------------------
+# RANSAC plane inlier distance.  Increase if the surface is noisy.
+--plane_threshold 5e-4
+
+# Min height above the ground plane for a pixel to be classified as stone.
+# Increase if the segmentation pulls in surface noise; decrease for very
+# flat / low-profile stones.
+--stone_offset 1e-3
+
+--ransac_iter 2000
+
+# Stride used when saving per-view stone clouds (1 = full resolution).
+--decimate 2
+
+
+# ----------------------------------------------------------------------------
+# ICP refinement
+# ----------------------------------------------------------------------------
+# Pairwise alignment of every view against view 0 (point-to-point ICP).
+--icp true
+
+# Maximum correspondence distance during ICP.  Should be a few mm: large
+# enough to bridge the coarse-alignment error, small enough to reject
+# wrong matches.
+--icp_max_corr 5e-3
